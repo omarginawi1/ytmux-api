@@ -1,55 +1,73 @@
-# server.py
-import os, time, json
+import os, time, json, re
 from flask import Flask, request, jsonify
 from waitress import serve
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
 
-# ========= إعداد التطبيق =========
 app = Flask(__name__)
 
-# كاش بسيط داخل الذاكرة
-CACHE = {}              # key -> {"ts": epoch, "data": ...}
-CACHE_TTL = 300         # 5 دقائق
+# ===== إعدادات عامة =====
+CACHE = {}               # { key: {"ts": epoch, "data": dict} }
+CACHE_TTL = 300          # 5 دقائق
+ALLOW_ORIGIN = os.environ.get("ALLOW_ORIGIN", "*")  # عدّل لو حبيت دومينك فقط
 
-# مفتاح RapidAPI كفالباك (ضفّه من Render -> Settings -> Environment)
-RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY", "").strip()
+# (اختياري) محتوى cookies.txt يمكن وضعه في متغيّر بيئة (يفيد عند قيود يوتيوب)
+COOKIES_PATH = None
+cookies_txt = os.environ.get("YTDLP_COOKIES_TXT", "").strip()
+if cookies_txt:
+    COOKIES_PATH = "/tmp/yt_cookies.txt"
+    with open(COOKIES_PATH, "w", encoding="utf-8") as f:
+        f.write(cookies_txt)
 
-# مزودات RapidAPI الممكن تجربتها (ترجع mp4 مدمج عادة)
-RAPID_PROVIDERS = [
-    # 1) ytstream (MP4 مباشر عادة)
-    {"host": "ytstream-download-youtube-videos.p.rapidapi.com", "path": "/dl", "id_param": "id"},
+def cors_headers():
+    return {
+        "Access-Control-Allow-Origin": ALLOW_ORIGIN,
+        "Access-Control-Allow-Methods": "GET, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, Accept"
+    }
 
-    # 2) simple-youtube-dl (يعيد روابط وصيغ عديدة)
-    {"host": "simple-youtube-dl.p.rapidapi.com", "path": "/video/info", "id_param": "id"},
+@app.after_request
+def add_cors(resp):
+    for k,v in cors_headers().items():
+        resp.headers[k] = v
+    return resp
 
-    # 3) youtube-media-downloader (يرجع التفاصيل/الصيغ ثم ننتقي الـMP4)
-    {"host": "youtube-media-downloader.p.rapidapi.com", "path": "/v2/video/details", "id_param": "videoId"},
-]
+# ===== أدوات =====
+ID_RE = re.compile(r'^[\w\-]{6,}$')
 
-# ========= أدوات مساعدة =========
-def cache_get(key: str):
-    item = CACHE.get(key)
-    if not item:
-        return None
-    if time.time() - item["ts"] > CACHE_TTL:
-        CACHE.pop(key, None)
-        return None
-    return item["data"]
-
-def cache_set(key: str, data):
-    CACHE[key] = {"ts": time.time(), "data": data}
-
-def normalize_id_or_url(s: str | None) -> str | None:
+def normalize_id_or_url(s: str|None) -> str|None:
     s = (s or "").strip()
     if not s:
         return None
     if s.startswith(("http://", "https://")):
+        # استخراج ID لو أرسلت رابط كامل
+        try:
+            from urllib.parse import urlparse, parse_qs
+            u = urlparse(s)
+            if "youtu.be" in u.netloc:
+                vid = u.path.strip("/").split("/")[0]
+                return f"https://www.youtube.com/watch?v={vid}"
+            if "youtube.com" in u.netloc:
+                q = parse_qs(u.query)
+                vid = (q.get("v") or [None])[0]
+                if vid:
+                    return f"https://www.youtube.com/watch?v={vid}"
+        except Exception:
+            pass
         return s
-    return f"https://www.youtube.com/watch?v={s}"
+    # مجرّد ID
+    if ID_RE.match(s):
+        return f"https://www.youtube.com/watch?v={s}"
+    return None
+
+def to_height(label: str) -> int:
+    m = re.search(r'(\d+)', label or "")
+    return int(m.group(1)) if m else 0
 
 def pick_progressive_mp4(formats: list[dict]) -> list[dict]:
-    """نختار فقط صيغ MP4 المدمجة (فيديو+صوت) ونرتبها من الأعلى للأدنى."""
+    """
+    نختار فقط MP4 مدمج (فيديو+صوت) ونرتّب نزولًا، ونزيل التكرارات على نفس التسمية.
+    """
     out = []
     for f in formats or []:
         if f.get("ext") != "mp4":
@@ -61,20 +79,16 @@ def pick_progressive_mp4(formats: list[dict]) -> list[dict]:
         url = f.get("url")
         if not url:
             continue
-        height = f.get("height") or 0
-        label = f.get("format_note") or (f"{height}p" if height else "MP4")
+        h = f.get("height") or 0
+        label = f.get("format_note") or (f"{h}p" if h else "MP4")
         size = f.get("filesize") or f.get("filesize_approx")
-        out.append({
-            "label": label,
-            "ext": "mp4",
-            "filesize": int(size) if size else None,
-            "url": url
-        })
-    def to_num(lbl: str) -> int:
-        digits = "".join(ch for ch in lbl if ch.isdigit())
-        return int(digits) if digits else 0
-    out.sort(key=lambda x: to_num(x["label"]), reverse=True)
-    # إزالة التكرارات بحسب التسمية
+        try:
+            size = int(size) if size else None
+        except Exception:
+            size = None
+        out.append({"label": label, "ext":"mp4", "filesize": size, "url": url})
+
+    out.sort(key=lambda x: to_height(x["label"]), reverse=True)
     uniq, seen = [], set()
     for it in out:
         if it["label"] in seen:
@@ -83,9 +97,11 @@ def pick_progressive_mp4(formats: list[dict]) -> list[dict]:
         uniq.append(it)
     return uniq
 
-# ========= المصدر الأول: yt-dlp =========
-def ytdlp_info(video_url: str) -> dict:
-    """نستخدم yt-dlp كمكتبة مع هيدرز واقعية، IPv4، ومحاولات إعادة."""
+def ytdlp_extract(video_url: str) -> dict:
+    """
+    نستخدم yt-dlp كمكتبة مع رؤوس متصفح واقعية + IPv4 + إعادة محاولات.
+    لو لديك كوكيز سيتم تمريرها تلقائيًا.
+    """
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
@@ -97,135 +113,70 @@ def ytdlp_info(video_url: str) -> dict:
         "concurrent_fragment_downloads": 1,
         "forceipv4": True,
         "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Linux; Android 11; Pixel 5) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Mobile Safari/537.36"
-            ),
+            "User-Agent": ("Mozilla/5.0 (Linux; Android 11; Pixel 5) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                           "Chrome/124.0.0.0 Mobile Safari/537.36"),
             "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
         },
         "extractor_args": {
             "youtube": {
-                "player_client": ["android", "web"]  # جرّب android ثم web
+                "player_client": ["android", "web"],  # جرّب android ثم web
             }
         },
     }
+    if COOKIES_PATH:
+        ydl_opts["cookiefile"] = COOKIES_PATH
+
     with YoutubeDL(ydl_opts) as ydl:
         return ydl.extract_info(video_url, download=False)
 
-# ========= المصدر الثاني: RapidAPI (فالباك تلقائي) =========
-import urllib.parse, urllib.request
+def cache_get(key: str):
+    v = CACHE.get(key)
+    if not v:
+        return None
+    if time.time() - v["ts"] > CACHE_TTL:
+        CACHE.pop(key, None)
+        return None
+    return v["data"]
 
-def call_rapidapi(video_id: str):
-    """يحاول عدة مزودات على RapidAPI ويُرجع قائمة mp4 إن توفرت."""
-    if not RAPIDAPI_KEY:
-        return None, {"reason": "no-rapidapi-key"}
+def cache_set(key: str, data: dict):
+    CACHE[key] = {"ts": time.time(), "data": data}
 
-    diag = []
-    for prov in RAPID_PROVIDERS:
-        try:
-            q = f"?{prov['id_param']}=" + urllib.parse.quote_plus(video_id)
-            url = f"https://{prov['host']}{prov['path']}{q}"
-            req = urllib.request.Request(url, headers={
-                "X-RapidAPI-Key": RAPIDAPI_KEY,
-                "X-RapidAPI-Host": prov["host"],
-                "Accept": "application/json",
-            })
-            with urllib.request.urlopen(req, timeout=12) as resp:
-                raw = resp.read().decode("utf-8", "ignore")
-            j = json.loads(raw)
+# ===== REST =====
+@app.route("/", methods=["GET"])
+def root():
+    return jsonify(ok=True, service="ytmux-local", usage="/streams?vid=VIDEO_ID")
 
-            # تطبيع المخرجات إلى قائمة موحدة
-            src = []
-            if isinstance(j, dict):
-                if isinstance(j.get("formats"), list):
-                    src += j["formats"]
-                if isinstance(j.get("adaptiveFormats"), list):
-                    src += j["adaptiveFormats"]
-                # بعض المزودين يرجّع رابطًا مباشرًا واحدًا
-                if isinstance(j.get("link"), str):
-                    src.append({"url": j["link"], "type": "video/mp4", "qualityLabel": "MP4"})
-
-            fmts = []
-            for f in src:
-                url2 = f.get("url") or f.get("download")
-                if not url2:
-                    continue
-                mime = (f.get("type") or f.get("mimeType") or "").lower()
-                has_video = f.get("hasVideo")
-                has_audio = f.get("hasAudio")
-                if has_video is None:
-                    has_video = "video" in mime
-                if has_audio is None:
-                    has_audio = ("audio" in mime) or ("mp4" in mime)
-                if not (has_video and has_audio):
-                    continue
-                label = (
-                    f.get("qualityLabel")
-                    or f.get("quality")
-                    or (str(f.get("height")) + "p" if f.get("height") else "MP4")
-                )
-                size = f.get("contentLength") or f.get("filesize") or None
-                try:
-                    size = int(size) if size else None
-                except Exception:
-                    size = None
-                fmts.append({"label": label, "ext": "mp4", "filesize": size, "url": url2})
-
-            fmts.sort(
-                key=lambda x: int("".join(ch for ch in x["label"] if ch.isdigit()) or "0"),
-                reverse=True,
-            )
-            if fmts:
-                return {"ok": True, "provider": f"RapidAPI:{prov['host']}", "formats": fmts}, None
-
-            diag.append({"host": prov["host"], "ok": False, "why": "no-mp4"})
-        except Exception as e:
-            diag.append({"host": prov["host"], "ok": False, "err": str(e)[:140]})
-
-    return None, {"reason": "providers-failed", "diag": diag}
-
-# ========= نقاط النهاية =========
-@app.get("/streams")
+@app.route("/streams", methods=["GET", "OPTIONS"])
 def streams():
+    if request.method == "OPTIONS":
+        return ("", 204, cors_headers())
+
     vid = request.args.get("vid") or request.args.get("url") or request.args.get("id")
     video_url = normalize_id_or_url(vid)
     if not video_url:
         return jsonify(ok=False, error="bad-video-id"), 400
 
-    # كاش
     cached = cache_get(video_url)
     if cached:
         return jsonify(cached)
 
-    # 1) yt-dlp أولًا
     try:
-        info = ytdlp_info(video_url)
+        info = ytdlp_extract(video_url)
         fmts = pick_progressive_mp4(info.get("formats") or [])
-        if fmts:
-            data = {"ok": True, "provider": "yt-dlp", "formats": fmts}
+        if not fmts:
+            data = {"ok": False, "error": "no-progressive-mp4"}
             cache_set(video_url, data)
-            return jsonify(data)
-    except DownloadError:
-        pass
-    except Exception:
-        pass
-
-    # 2) RapidAPI فالباك
-    data, why = call_rapidapi(vid or "")
-    if data:
+            return jsonify(data), 404
+        data = {"ok": True, "provider": "yt-dlp", "formats": fmts}
         cache_set(video_url, data)
         return jsonify(data)
-
-    fail = {"ok": False, "error": "all-providers-failed", "detail": why}
-    cache_set(video_url, fail)
-    return jsonify(fail), 502
-
-@app.get("/")
-def root():
-    return jsonify(ok=True, service="ytmux-api", usage="/streams?vid=VIDEO_ID")
+    except DownloadError as e:
+        return jsonify(ok=False, error="ytdlp-failed", detail=str(e)[:600]), 502
+    except Exception as e:
+        return jsonify(ok=False, error="internal", detail=str(e)[:600]), 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
+    # waitress مناسب لـ Render/هوستنجر
     serve(app, host="0.0.0.0", port=port)
-
