@@ -17,9 +17,14 @@ RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY", "").strip()
 
 # مزودات RapidAPI الممكن تجربتها (ترجع mp4 مدمج عادة)
 RAPID_PROVIDERS = [
+    # 1) ytstream (MP4 مباشر عادة)
     {"host": "ytstream-download-youtube-videos.p.rapidapi.com", "path": "/dl", "id_param": "id"},
-    # يمكنك إضافة مزودات أخرى هنا بنفس البنية
-    # {"host": "youtube-mp36.p.rapidapi.com", "path": "/dl", "id_param": "id"},
+
+    # 2) simple-youtube-dl (يعيد روابط وصيغ عديدة)
+    {"host": "simple-youtube-dl.p.rapidapi.com", "path": "/video/info", "id_param": "id"},
+
+    # 3) youtube-media-downloader (يرجع التفاصيل/الصيغ ثم ننتقي الـMP4)
+    {"host": "youtube-media-downloader.p.rapidapi.com", "path": "/v2/video/details", "id_param": "videoId"},
 ]
 
 # ========= أدوات مساعدة =========
@@ -223,3 +228,4 @@ def root():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
     serve(app, host="0.0.0.0", port=port)
+
